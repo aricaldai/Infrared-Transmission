@@ -1,0 +1,242 @@
+/*
+  ESP32 IR transmitter for the 10-digit code
+  Type 10 digits on the keypad, press # to send them repeatedly for 30 seconds.
+    *  = backspace
+    #  = send (needs exactly 10 digits)
+
+  Protocol (must match ir_receiver.ino) - every number is a burst ("mark") or gap ("space") in us:
+    frame       : START BLOCK, then 10 bytes (the ASCII digits), then at least 100 ms of silence
+    START BLOCK : mark 8000, space 4000   (tells the receiver "the code begins now")
+    per byte    : start  mark 1000, space 500
+                  8 bits mark 400, space 400 = '0' / 1200 = '1'   (MSB first)
+                  stop   mark 400, space 1000
+
+  The start block is sent before EVERY frame, so the receiver can join at any moment and
+  only records digits that come right after a start block.
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+
+// --- LCD Setup ---
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- Keypad Setup (4 Rows x 3 Columns) ---
+const byte ROWS = 4;
+const byte COLS = 3;
+
+byte rowPins[ROWS] = {27, 26, 25, 33}; // Header Pins 4, 5, 6, 7
+byte colPins[COLS] = {13, 12, 14};     // Header Pins 1, 2, 3
+
+char keys[ROWS][COLS] = {
+  {'#', '0', '*'},
+  {'9', '8', '7'},
+  {'6', '5', '4'},
+  {'3', '2', '1'}
+};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// --- IR Hardware Setup ---
+const int      IR_TX_PIN    = 19;
+const uint32_t CARRIER_HZ   = 38000;
+const uint8_t  CARRIER_DUTY = 128;       // 128 of 256 = 50 % duty while a burst is on
+const uint8_t  LEDC_CHANNEL = 0;         // only used by ESP32 Arduino core 2.x
+
+// --- Start block timing (must match the receiver) ---
+const uint32_t START_BLOCK_MARK_US  = 8000;
+const uint32_t START_BLOCK_SPACE_US = 4000;
+
+char codeBuffer[11];
+byte inputIndex = 0;
+
+// Function Declarations
+void resetInput();
+void updateLCDDisplay();
+void transmitFor30Seconds(const char* code);
+void sendStartBlock();
+void sendFrame(const char* code);
+void sendIRByte(uint8_t data);
+void mark(uint32_t durationUs);
+void space(uint32_t durationUs);
+
+// ---------------------- 38 kHz carrier (LEDC PWM) ----------------------
+// Core 3.x and core 2.x have different LEDC functions; this works on both.
+void carrierBegin() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(IR_TX_PIN, CARRIER_HZ, 8);
+  ledcWrite(IR_TX_PIN, 0);
+#else
+  ledcSetup(LEDC_CHANNEL, CARRIER_HZ, 8);
+  ledcAttachPin(IR_TX_PIN, LEDC_CHANNEL);
+  ledcWrite(LEDC_CHANNEL, 0);
+#endif
+}
+
+void carrier(bool on) {
+  uint32_t duty = on ? CARRIER_DUTY : 0;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(IR_TX_PIN, duty);
+#else
+  ledcWrite(LEDC_CHANNEL, duty);
+#endif
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Keypad Internal Pull-ups
+  for (int i = 0; i < ROWS; i++) pinMode(rowPins[i], INPUT_PULLUP);
+  for (int j = 0; j < COLS; j++) pinMode(colPins[j], INPUT_PULLUP);
+
+  // IR LED off, carrier generator ready
+  carrierBegin();
+
+  // Initialize LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+
+  resetInput();
+}
+
+void loop() {
+  char key = keypad.getKey();
+
+  if (key) {
+    // '*' Key -> Delete Last Digit (Backspace)
+    if (key == '*') {
+      if (inputIndex > 0) {
+        inputIndex--;
+        codeBuffer[inputIndex] = '\0';
+        updateLCDDisplay();
+      }
+      return;
+    }
+
+    // '#' Key -> Submit / Start 30-Second Transmission Window
+    if (key == '#') {
+      if (inputIndex == 10) {
+        transmitFor30Seconds(codeBuffer);
+      } else {
+        lcd.setCursor(0, 0);
+        lcd.print("Need 10 digits! ");   // 16 characters
+        delay(1000);
+        updateLCDDisplay();
+      }
+      return;
+    }
+
+    // Numbers '0' - '9'
+    if (key >= '0' && key <= '9') {
+      if (inputIndex < 10) {
+        codeBuffer[inputIndex] = key;
+        inputIndex++;
+        codeBuffer[inputIndex] = '\0';
+        updateLCDDisplay();
+      }
+    }
+  }
+}
+
+void updateLCDDisplay() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enter 10-D Code:");
+  lcd.setCursor(0, 1);
+  lcd.print(codeBuffer);
+}
+
+void resetInput() {
+  inputIndex = 0;
+  memset(codeBuffer, 0, sizeof(codeBuffer));
+  updateLCDDisplay();
+}
+
+// A mark is a burst of 38 kHz light, a space is darkness.
+void mark(uint32_t durationUs) {
+  carrier(true);
+  delayMicroseconds(durationUs);
+  carrier(false);
+}
+
+void space(uint32_t durationUs) {
+  delayMicroseconds(durationUs);
+}
+
+// Transmit 1 Byte via IR Pulse-Distance Protocol
+void sendIRByte(uint8_t data) {
+  // Start Bit
+  mark(1000);
+  space(500);
+
+  // 8 Data Bits (MSB First)
+  for (int i = 7; i >= 0; i--) {
+    mark(400);
+    if ((data >> i) & 0x01) {
+      space(1200); // Bit '1' (Longer space)
+    } else {
+      space(400);  // Bit '0' (Shorter space)
+    }
+  }
+
+  // Stop Bit
+  mark(400);
+  space(1000);
+}
+
+// START BLOCK: tells the receiver the 10 code bytes follow immediately.
+void sendStartBlock() {
+  mark(START_BLOCK_MARK_US);
+  space(START_BLOCK_SPACE_US);
+}
+
+// One frame = start block + 10 ASCII digits
+void sendFrame(const char* code) {
+  sendStartBlock();
+  for (int i = 0; i < 10; i++) {
+    sendIRByte((uint8_t)code[i]);
+  }
+}
+
+// Continuous 30-Second Transmit Loop
+void transmitFor30Seconds(const char* code) {
+  const unsigned long TRANSMIT_WINDOW_MS = 30000; // 30 seconds
+  unsigned long startTime = millis();
+  int shownSec = -1;
+
+  Serial.print("Starting 30-second IR Transmission: ");
+  Serial.println(code);
+
+  lcd.clear();
+  lcd.setCursor(0, 1);
+  lcd.print(code);
+
+  while (millis() - startTime < TRANSMIT_WINDOW_MS) {
+    int remainingSec = 30 - (int)((millis() - startTime) / 1000);
+
+    // Touch the LCD only when the number changes (about once per second)
+    if (remainingSec != shownSec) {
+      shownSec = remainingSec;
+      char line[17];
+      snprintf(line, sizeof(line), "Sending %02ds left", remainingSec);
+      lcd.setCursor(0, 0);
+      lcd.print(line);
+    }
+
+    sendFrame(code);   // start block, then the code
+    delay(100);        // Inter-frame silence (receiver needs 6 ms or more)
+  }
+
+  // IR LED off when the transmission window completes
+  carrier(false);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Tx Complete!");
+  delay(1500);
+
+  resetInput();
+}

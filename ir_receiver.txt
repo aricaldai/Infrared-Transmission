@@ -1,0 +1,306 @@
+/*
+  ESP32 IR receiver for the 10-digit-code transmitter
+  Receiver: Adafruit IR transceiver (38 kHz demodulating receiver, output idles HIGH,
+  goes LOW while a 38 kHz burst is present).
+
+  How it works
+    1. An interrupt timestamps every edge on IR_RX_PIN (so LCD/Serial work can't make us miss pulses).
+    2. loop() turns the edge stream into (mark, space) widths in microseconds.
+    3. IrCodeDecoder (a small state machine) WAITS for the START BLOCK, and only then
+       starts recording the code bytes:
+         START BLOCK : mark 8000, space 4000      (required - digits without it are ignored)
+         per byte    : start  mark 1000, space 500
+                       8 bits mark 400, space 400 = '0' / 1200 = '1'   (MSB first)
+                       stop   mark 400, space 1000
+         frame       : START BLOCK + 10 bytes (ASCII digits), then a long silence
+    4. "Start" of a transmission = first start block. "End" = no valid frame for END_TIMEOUT_MS.
+       A code is accepted once FRAMES_TO_CONFIRM identical frames in a row have been seen.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------------------------- Settings ----------------------------
+const int IR_RX_PIN = 19;                 // GPIO wired to the module's receiver output
+#define MARK_LEVEL LOW                    // level the receiver output has during a burst
+#define USE_LCD 1                         // 1 = show status on a 16x2 I2C LCD at 0x27
+#define DEBUG_PULSES 0                    // 1 = print raw pulse widths (for tuning)
+
+const uint8_t  FRAMES_TO_CONFIRM = 2;     // identical frames in a row before a code is accepted
+const uint32_t END_TIMEOUT_MS    = 1500;  // no valid frame for this long = transmission ended
+
+// ==== DECODER_BEGIN (pure logic, no hardware calls) ====
+#include <stdint.h>
+#include <string.h>
+
+namespace Timing {
+  // All values in microseconds. Ranges are wide on purpose: IR receiver modules
+  // stretch/shrink pulses by roughly +/-150 us.
+  const uint32_t GAP_MIN            = 6000;   // any space this long = silence between frames
+  const uint32_t PRE_MARK_MIN       = 5500;   // START BLOCK mark  (sent: 8000)
+  const uint32_t PRE_MARK_MAX       = 11000;
+  const uint32_t PRE_SPACE_MIN      = 2000;   // START BLOCK space (sent: 4000)
+  const uint32_t PRE_SPACE_MAX      = 5900;
+  const uint32_t START_MARK_MIN     = 750;    // byte start mark (sent: 1000)
+  const uint32_t START_MARK_MAX     = 1800;
+  const uint32_t START_SPACE_MIN    = 200;    // byte start space (sent: 500)
+  const uint32_t START_SPACE_MAX    = 1000;
+  const uint32_t DATA_MARK_MIN      = 120;    // data/stop mark  (sent: 400)
+  const uint32_t DATA_MARK_MAX      = 750;
+  const uint32_t DATA_SPACE_MIN     = 120;    // data space: 400 = '0', 1200 = '1'
+  const uint32_t DATA_SPACE_MAX     = 2000;
+  const uint32_t BIT_THRESHOLD      = 800;    // space longer than this = '1'
+  const uint32_t STOP_SPACE_MIN     = 200;    // stop space      (sent: 1000)
+  const uint32_t STOP_SPACE_MAX     = 2500;
+}
+
+class IrCodeDecoder {
+public:
+  // START_OK is returned the moment a valid start block has been seen (recording begins).
+  enum Result : uint8_t { NONE, START_OK, FRAME_OK, FRAME_BAD };
+  static const uint8_t CODE_LEN = 10;
+
+  IrCodeDecoder() { _state = S_IDLE; _count = 0; _bits = 0; _bitCount = 0; _code[0] = 0; }
+
+  const char* code() const { return _code; }
+
+  // Feed one pulse: isMark = true for a burst (output at MARK_LEVEL), false for a gap.
+  Result feed(bool isMark, uint32_t us) {
+    using namespace Timing;
+
+    // A long space can only be silence between frames. It always re-arms the decoder.
+    if (!isMark && us >= GAP_MIN) {
+      bool broke = (_state != S_IDLE && _state != S_READY);
+      _state = S_READY;
+      _count = 0;
+      return broke ? FRAME_BAD : NONE;
+    }
+
+    switch (_state) {
+      case S_IDLE:                       // not synced: wait for a gap
+        return NONE;
+
+      case S_READY:                      // gap seen: ONLY a start block is accepted
+        if (isMark && in(us, PRE_MARK_MIN, PRE_MARK_MAX))     { _state = S_PRE_SPACE; return NONE; }
+        return fail();
+
+      case S_PRE_SPACE:                  // second half of the start block
+        if (!isMark && in(us, PRE_SPACE_MIN, PRE_SPACE_MAX)) {
+          _state = S_START_MARK;         // start block confirmed -> begin recording the code
+          _count = 0;
+          return START_OK;
+        }
+        return fail();
+
+      case S_START_MARK:
+        if (isMark && in(us, START_MARK_MIN, START_MARK_MAX)) { _state = S_START_SPACE; return NONE; }
+        return fail();
+
+      case S_START_SPACE:
+        if (!isMark && in(us, START_SPACE_MIN, START_SPACE_MAX)) {
+          _bits = 0; _bitCount = 0; _state = S_BIT_MARK; return NONE;
+        }
+        return fail();
+
+      case S_BIT_MARK:
+        if (isMark && in(us, DATA_MARK_MIN, DATA_MARK_MAX))   { _state = S_BIT_SPACE;   return NONE; }
+        return fail();
+
+      case S_BIT_SPACE:
+        if (!isMark && in(us, DATA_SPACE_MIN, DATA_SPACE_MAX)) {
+          _bits = (uint8_t)((_bits << 1) | (us > BIT_THRESHOLD ? 1 : 0));
+          _state = (++_bitCount == 8) ? S_STOP_MARK : S_BIT_MARK;
+          return NONE;
+        }
+        return fail();
+
+      case S_STOP_MARK:
+        if (isMark && in(us, DATA_MARK_MIN, DATA_MARK_MAX)) {
+          if (_bits < '0' || _bits > '9') return fail();      // only digits are valid
+          _code[_count++] = (char)_bits;
+          if (_count == CODE_LEN) {                           // 10th stop bit = end of frame
+            _code[CODE_LEN] = 0;
+            _state = S_IDLE;                                  // wait for the next gap
+            _count = 0;
+            return FRAME_OK;
+          }
+          _state = S_STOP_SPACE;
+          return NONE;
+        }
+        return fail();
+
+      case S_STOP_SPACE:
+        if (!isMark && in(us, STOP_SPACE_MIN, STOP_SPACE_MAX)) { _state = S_START_MARK; return NONE; }
+        return fail();
+    }
+    return fail();
+  }
+
+private:
+  enum State : uint8_t {
+    S_IDLE, S_READY, S_PRE_SPACE, S_START_MARK, S_START_SPACE,
+    S_BIT_MARK, S_BIT_SPACE, S_STOP_MARK, S_STOP_SPACE
+  };
+
+  static bool in(uint32_t v, uint32_t lo, uint32_t hi) { return v >= lo && v <= hi; }
+
+  Result fail() {
+    bool broke = (_state != S_IDLE && _state != S_READY);
+    _state = S_IDLE;
+    _count = 0;
+    return broke ? FRAME_BAD : NONE;
+  }
+
+  State   _state;
+  uint8_t _count;
+  uint8_t _bits;
+  uint8_t _bitCount;
+  char    _code[CODE_LEN + 1];
+};
+// ==== DECODER_END ====
+
+// ----------------------- Edge capture (ISR) -----------------------
+const uint16_t RING = 1024;               // must be a power of two
+volatile uint32_t edgeTime[RING];
+volatile uint8_t  edgeLevel[RING];
+volatile uint16_t head = 0;
+uint16_t tail = 0;
+
+void IRAM_ATTR onEdge() {
+  edgeTime[head]  = micros();
+  edgeLevel[head] = digitalRead(IR_RX_PIN);
+  head = (head + 1) & (RING - 1);
+}
+
+// ----------------------------- State ------------------------------
+#if USE_LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+#endif
+
+IrCodeDecoder decoder;
+
+bool     haveLast = false;
+uint32_t lastT = 0;
+uint8_t  lastLvl = 0;
+
+bool     inTransmission = false;
+bool     startShown = false;
+uint32_t lastFrameMs = 0;
+char     candidate[11] = "";
+uint8_t  matches = 0;
+bool     reported = false;
+
+void showLines(const char* l0, const char* l1) {
+#if USE_LCD
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(l0);
+  lcd.setCursor(0, 1); lcd.print(l1);
+#endif
+}
+
+// Called when a start block is detected. Shown once per transmission.
+void onStartBlock() {
+  lastFrameMs = millis();                 // a start block counts as activity
+  if (!startShown) {
+    startShown = true;
+    Serial.println("[RX] start block detected - recording code");
+    showLines("Start block!", "Recording...");
+  }
+}
+
+// Called once per transmission when FRAMES_TO_CONFIRM identical frames have been received.
+void onCodeReceived(const char* code) {
+  Serial.print("[RX] code received: ");
+  Serial.println(code);
+  showLines("Code received:", code);
+}
+
+void onFrame(const char* code) {
+  lastFrameMs = millis();
+
+  if (!inTransmission) {
+    inTransmission = true;
+    Serial.println("[RX] transmission started");
+  }
+
+  if (strcmp(code, candidate) == 0) {
+    if (matches < 255) matches++;
+  } else {
+    strcpy(candidate, code);
+    matches = 1;
+    reported = false;
+  }
+
+  if (matches >= FRAMES_TO_CONFIRM && !reported) {
+    reported = true;
+    onCodeReceived(candidate);
+  }
+}
+
+void checkTransmissionEnd() {
+  if ((inTransmission || startShown) && (millis() - lastFrameMs) > END_TIMEOUT_MS) {
+    inTransmission = false;
+    startShown = false;
+    if (reported) {
+      Serial.print("[RX] transmission ended, last code: ");
+      Serial.println(candidate);
+      showLines("Tx ended. Code:", candidate);
+    } else {
+      Serial.println("[RX] transmission ended (no confirmed code)");
+      showLines("Tx ended", "No valid code");
+    }
+    candidate[0] = 0;
+    matches = 0;
+    reported = false;
+  }
+}
+
+void handlePulse(bool isMark, uint32_t us) {
+#if DEBUG_PULSES
+  Serial.print(isMark ? 'M' : 'S');
+  Serial.print(us);
+  Serial.print(' ');
+  if (!isMark && us >= Timing::GAP_MIN) Serial.println();
+#endif
+  IrCodeDecoder::Result r = decoder.feed(isMark, us);
+  if (r == IrCodeDecoder::START_OK)      onStartBlock();
+  else if (r == IrCodeDecoder::FRAME_OK) onFrame(decoder.code());
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+#if USE_LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+#endif
+  showLines("IR Receiver", "Waiting...");
+
+  pinMode(IR_RX_PIN, INPUT_PULLUP);
+  Serial.print("[RX] idle level on RX pin: ");
+  Serial.println(digitalRead(IR_RX_PIN) ? "HIGH (expected)" : "LOW (check MARK_LEVEL / wiring)");
+
+  decoder.feed(false, Timing::GAP_MIN);   // assume the line was idle at boot
+  attachInterrupt(digitalPinToInterrupt(IR_RX_PIN), onEdge, CHANGE);
+}
+
+void loop() {
+  while (tail != head) {
+    uint32_t t   = edgeTime[tail];
+    uint8_t  lvl = edgeLevel[tail];
+    tail = (tail + 1) & (RING - 1);
+
+    if (!haveLast) { lastT = t; lastLvl = lvl; haveLast = true; continue; }
+    if (lvl == lastLvl) continue;                 // glitch: pin already back to previous level
+
+    bool wasMark = (lastLvl == MARK_LEVEL);       // the level that just ended
+    uint32_t dur = t - lastT;
+    lastT = t;
+    lastLvl = lvl;
+    handlePulse(wasMark, dur);
+  }
+  checkTransmissionEnd();
+}
